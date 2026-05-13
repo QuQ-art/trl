@@ -7,17 +7,20 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
+# distributed under the License is distributed one:\minillm_trainer_changes.md an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import textwrap
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+
+from transformers.cache_utils import DynamicCache
 from datasets import Dataset, IterableDataset
 from packaging.version import Version
 from transformers import (
@@ -242,6 +245,23 @@ class MiniLLMTrainer(GRPOTrainer):
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
 
+        # Teacher-side KV cache mode for MiniLLM experiments.
+        #
+        # - "none": keep the original MiniLLM behavior and compute teacher logits with use_cache=False.
+        # - "gpu": compute teacher logits with KV cache enabled and keep the cache on GPU.
+        # - "offload": compute teacher logits with KV cache enabled and offload the cache to CPU.
+        self.teacher_kv_mode = os.environ.get("MINILLM_TEACHER_KV_MODE", "none").lower()
+
+        if self.teacher_kv_mode not in {"none", "gpu", "offload"}:
+            raise ValueError(
+                "MINILLM_TEACHER_KV_MODE must be one of: none, gpu, offload. "
+                f"Got: {self.teacher_kv_mode}"
+            )
+
+        self.teacher_kv_enabled = self.teacher_kv_mode in {"gpu", "offload"}
+        self.teacher_kv_offload = self.teacher_kv_mode == "offload"
+        self._teacher_kv_debug_printed = False
+
     def _single_step_decomposition_loss(
         self,
         student_log_probs: torch.Tensor,
@@ -346,39 +366,159 @@ class MiniLLMTrainer(GRPOTrainer):
 
         return advantages
 
+    def _get_teacher_config(self):
+        if hasattr(self.teacher_model, "config"):
+            return self.teacher_model.config
+        if hasattr(self.teacher_model, "module") and hasattr(self.teacher_model.module, "config"):
+            return self.teacher_model.module.config
+        raise AttributeError("Cannot find config from teacher_model.")
+
+    def _teacher_logits_with_kv_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prompt_lengths: int,
+    ) -> torch.Tensor:
+        """
+        Compute teacher logits for completion tokens using teacher-side KV cache.
+
+        This helper is used when ``MINILLM_TEACHER_KV_MODE`` is set to either
+        ``"gpu"`` or ``"offload"``:
+
+        - ``"gpu"``: keep the KV cache on GPU with ``DynamicCache(offloading=False)``.
+        - ``"offload"``: offload the KV cache to CPU with ``DynamicCache(offloading=True)``.
+
+        It replaces the original full-sequence teacher forward with a prompt
+        prefill followed by token-by-token cached forward passes.
+
+        Returned shape:
+            [batch_size, completion_length, vocab_size]
+        """
+        self.teacher_model.eval()
+
+        _, seq_len = input_ids.shape
+        completion_length = seq_len - prompt_lengths
+
+        if completion_length <= 0:
+            raise ValueError(
+                f"Invalid completion_length={completion_length}. "
+                f"seq_len={seq_len}, prompt_lengths={prompt_lengths}"
+            )
+
+        teacher_config = self._get_teacher_config()
+
+        past_key_values = DynamicCache(
+            config=teacher_config,
+            offloading=self.teacher_kv_offload,
+        )
+
+        if not self._teacher_kv_debug_printed:
+            print("=" * 80)
+            print("[TEACHER_KV] enabled")
+            print("[TEACHER_KV] mode:", self.teacher_kv_mode)
+            print("[TEACHER_KV] cache class:", past_key_values.__class__.__name__)
+            print("[TEACHER_KV] offloading:", getattr(past_key_values, "offloading", None))
+            print("[TEACHER_KV] input_ids shape:", tuple(input_ids.shape))
+            print("[TEACHER_KV] prompt_lengths:", prompt_lengths)
+            print("[TEACHER_KV] completion_length:", completion_length)
+            print("=" * 80)
+            self._teacher_kv_debug_printed = True
+
+        logits_for_completion = []
+
+        # 1. Prefill prompt in one forward.
+        # The last prompt position predicts the first completion token.
+        prompt_input_ids = input_ids[:, :prompt_lengths]
+        prompt_attention_mask = attention_mask[:, :prompt_lengths]
+
+        outputs = self.teacher_model(
+            input_ids=prompt_input_ids,
+            attention_mask=prompt_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+
+        past_key_values = outputs.past_key_values
+        logits_for_completion.append(outputs.logits[:, -1:, :])
+
+        # 2. Feed completion tokens one by one.
+        # At each position, the output logits predict the next token.
+        # We only need positions up to seq_len - 2.
+        for pos in range(prompt_lengths, seq_len - 1):
+            current_input_ids = input_ids[:, pos : pos + 1]
+            current_attention_mask = attention_mask[:, : pos + 1]
+
+            outputs = self.teacher_model(
+                input_ids=current_input_ids,
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+            past_key_values = outputs.past_key_values
+            logits_for_completion.append(outputs.logits[:, -1:, :])
+
+        teacher_logits = torch.cat(logits_for_completion, dim=1)
+
+        if teacher_logits.shape[1] != completion_length:
+            raise RuntimeError(
+                f"teacher_logits length mismatch: got {teacher_logits.shape[1]}, "
+                f"expected {completion_length}"
+            )
+
+        return teacher_logits
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
         attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
+        prompt_lengths = inputs["prompt_ids"].shape[1]
+        shifted_labels = input_ids[:, prompt_lengths:]
 
-        # Compute student output
-        student_outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        # Compute student output.
+        # Student remains unchanged: full forward, no KV cache.
+        student_outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
 
-        # Compute teacher output in eval mode
+        student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
+
+        # Compute teacher output.
         self.teacher_model.eval()
         with torch.no_grad():
-            teacher_outputs = self.teacher_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-
-        # Slice the logits for the generated tokens using the inputs["prompts"] lengths
-        prompt_lengths = inputs["prompt_ids"].shape[1]
-        student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
-        teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
-        shifted_labels = input_ids[:, prompt_lengths:]
+            if self.teacher_kv_enabled:
+                teacher_logits = self._teacher_logits_with_kv_cache(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    prompt_lengths=prompt_lengths,
+                )
+            else:
+                teacher_outputs = self.teacher_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+                teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
 
         # Apply temperature scaling
         student_logits = student_logits / self.kd_temperature
         teacher_logits = teacher_logits / self.kd_temperature
 
-        # Compute log probabilities for student and probabilities for teacher
+        # Compute log probabilities for student and teacher
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
         student_log_probs_on_labels = torch.gather(
-            student_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
+            student_log_probs,
+            dim=-1,
+            index=shifted_labels.unsqueeze(-1),
         ).squeeze(-1)
+
         teacher_log_probs_on_labels = torch.gather(
-            teacher_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
+            teacher_log_probs,
+            dim=-1,
+            index=shifted_labels.unsqueeze(-1),
         ).squeeze(-1)
 
         mask = shifted_labels != -100
@@ -395,7 +535,7 @@ class MiniLLMTrainer(GRPOTrainer):
         # Compute GRPO loss on verifiable reward
         loss = self._compute_loss(model, inputs)
 
-        # Compute loss
+        # Compute MiniLLM single-step decomposition loss
         if self.single_step_decomposition:
             single_step_decomposition_loss = self._single_step_decomposition_loss(
                 student_log_probs=student_log_probs,
@@ -405,8 +545,6 @@ class MiniLLMTrainer(GRPOTrainer):
 
             loss += single_step_decomposition_loss
 
-        # Empty cache
         empty_cache()
 
-        # Return loss
         return (loss, student_outputs) if return_outputs else loss
