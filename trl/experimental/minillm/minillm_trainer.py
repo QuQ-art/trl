@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import textwrap
 
 import torch
@@ -31,7 +32,7 @@ from transformers.utils import is_peft_available
 
 from ...models import prepare_deepspeed
 from ...trainer.grpo_trainer import GRPOTrainer, RewardFunc, RolloutFunc
-from ...trainer.utils import disable_dropout_in_model, get_config_model_id
+from ...trainer.utils import disable_dropout_in_model, get_config_model_id, pad
 from ..utils import empty_cache
 from .minillm_config import MiniLLMConfig
 
@@ -187,6 +188,10 @@ class MiniLLMTrainer(GRPOTrainer):
             model_name = model_name.split("/")[-1]
             args = MiniLLMConfig(f"{model_name}-MiniLLM")
 
+        if args.teacher_mixin_alpha > 0.0 and args.temperature != args.kd_temperature:
+            raise ValueError("teacher-mixed sampling requires temperature == kd_temperature.")
+        # 是否必须？
+
         # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
         # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
         # (see https://github.com/huggingface/transformers/pull/43203) and is released (most likely in 5.0.0), we
@@ -230,23 +235,50 @@ class MiniLLMTrainer(GRPOTrainer):
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+        if args.teacher_mixin_alpha > 0.0:
+            student_config = (
+                self.model.config.text_config if hasattr(self.model.config, "text_config") else self.model.config
+            )
+            teacher_config = (
+                teacher_model.config.text_config
+                if hasattr(teacher_model.config, "text_config")
+                else teacher_model.config
+            )
+            student_vocab_size = getattr(student_config, "vocab_size", None)
+            teacher_vocab_size = getattr(teacher_config, "vocab_size", None)
+            if (
+                student_vocab_size is not None
+                and teacher_vocab_size is not None
+                and student_vocab_size != teacher_vocab_size
+            ):
+                raise ValueError("Teacher and student vocab sizes must match for teacher-mixed sampling.")
+
+        # if self.is_deepspeed_enabled:
+        #     self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+        # else:
+        #     self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+        self.teacher_model  = teacher_model.to("cuda:0") # 临时！！！
 
         self.temperature = args.temperature
         self.kd_temperature = args.kd_temperature
+        self.teacher_mixin_alpha = args.teacher_mixin_alpha
+        self.teacher_mixin_importance_clip = args.teacher_mixin_importance_clip
         self.single_step_decomposition = args.single_step_decomposition
         self.rkl_advantage = args.rkl_advantage
+        assert self.rkl_advantage, "As for miniLLM trainer, rkl_advantage must be true"
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
+
+        # 是否必须？
+        self._last_teacher_mixed_student_logps = None
+        self._last_teacher_mixed_logps = None
 
     def _single_step_decomposition_loss(
         self,
         student_log_probs: torch.Tensor,
         teacher_log_probs: torch.Tensor,
         mask: torch.Tensor | None = None,
+        importance_weights: torch.Tensor | None = None,
         reduction: str = "batchmean",
     ):
         """
@@ -271,9 +303,10 @@ class MiniLLMTrainer(GRPOTrainer):
         Returns:
             loss: Scalar tensor with the generalized JSD loss
         """
-        reg_loss = F.kl_div(
-            teacher_log_probs, student_log_probs, reduction="none", log_target=True
-        )  # (batch_size, sequence_length)
+        reg_loss = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True).sum(dim=-1)
+
+        if importance_weights is not None:
+            reg_loss = reg_loss * importance_weights
 
         # Masking
         if mask is not None:
@@ -295,22 +328,26 @@ class MiniLLMTrainer(GRPOTrainer):
         teacher_log_probs_on_labels: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        r"""Compute the advantage for Reverse KL Divergence.
+        r"""Compute the future-only advantage for Reverse KL Divergence.
 
         Mostly following [this
         implementation](https://github.com/microsoft/LMOps/blob/e210d2c026b9958617887762400778ace81172e6/minillm/minillm/losses.py#L37-L49).
 
         $$ \text{rewards}_t = \text{teacher\_log\_probs\_on\_labels}_t - \text{student\_log\_probs\_on\_labels}_t $$
 
-        If length normalization is enabled:
+        The current-token reward is handled by the single-step term, so the long-term MiniLLM advantage only uses
+        future rewards.
 
-        $$ \text{lengths}_t = \sum_{i=t}^{T} \gamma^{i-t} $$
+        When `gamma > 0`, we compute the discounted future return:
 
-        $$ \text{advantages}_t = \frac{\sum_{i=t}^{T} \gamma^{i-t} R_i}{\text{lengths}_t} $$
+        $$ \text{advantages}_t = \sum_{i=t+1}^{T} \gamma^{i-t-1} R_i $$
 
-        Otherwise:
+        Otherwise, we use the undiscounted future return:
 
-        $$ \text{advantages}_t = \sum_{i=t}^{T} \gamma^{i-t} R_i $$
+        $$ \text{advantages}_t = \sum_{i=t+1}^{T} R_i $$
+
+        If length normalization is enabled, the future return is divided by the corresponding discounted or
+        undiscounted future length.
 
         Args:
             student_log_probs_on_labels: Log probabilities of the student model on the labels.
@@ -330,27 +367,343 @@ class MiniLLMTrainer(GRPOTrainer):
 
         rewards = teacher_log_probs_on_labels - student_log_probs_on_labels  # (batch_size, sequence_length)
 
-        if self.gamma > 0.0:
-            gamma_pow = torch.pow(self.gamma, torch.arange(response_length, device=rewards.device))
+        if self.gamma > 0.0: # 需要检查为什么这么改
+            advantages = torch.zeros_like(rewards)
+            lengths = torch.zeros_like(rewards) if self.length_normalization else None
+            next_advantage = torch.zeros(rewards.size(0), device=rewards.device, dtype=rewards.dtype)
+            next_length = torch.zeros_like(next_advantage)
 
-            advantages = rewards * gamma_pow
-            advantages = advantages.flip(1).cumsum(dim=1).flip(1)
+            for t in range(response_length - 1, -1, -1):
+                advantages[:, t] = next_advantage
+                next_advantage = rewards[:, t] + self.gamma * next_advantage
+
+                if self.length_normalization:
+                    lengths[:, t] = next_length
+                    next_length = mask[:, t] + self.gamma * next_length
 
             if self.length_normalization:
-                mask = torch.where(mask < 0.5, 1e-4, mask)
-                lengths = mask * gamma_pow
-                lengths = lengths.flip(1).cumsum(dim=1).flip(1)
-                advantages = advantages / lengths
+                advantages = torch.where(
+                    lengths > 0, advantages / lengths.clamp_min(1.0), torch.zeros_like(advantages)
+                )
         else:
-            advantages = rewards
+            advantages = rewards.flip(1).cumsum(dim=1).flip(1) - rewards
 
-        return advantages
+            if self.length_normalization:
+                lengths = mask.flip(1).cumsum(dim=1).flip(1) - mask
+                advantages = torch.where(
+                    lengths > 0, advantages / lengths.clamp_min(1.0), torch.zeros_like(advantages)
+                )
+
+        return advantages * mask
+
+    def _validate_teacher_mixed_rollout(self, images, multimodal_fields):
+        if self.rollout_func is not None:
+            raise ValueError("teacher-mixed rollout is incompatible with rollout_func.")
+        if self.use_vllm:
+            raise ValueError("teacher-mixed rollout currently requires use_vllm=False.")
+        if self.use_transformers_paged:
+            raise ValueError(
+                "teacher-mixed rollout does not support use_transformers_paged. Use the standard transformers generation path instead."
+            )
+        if images is not None or multimodal_fields:
+            raise ValueError("teacher-mixed rollout currently supports text-only MiniLLM rollouts.")
+        if self.tools:
+            raise ValueError("teacher-mixed rollout does not support tool-augmented MiniLLM rollouts.")
+        if self.top_p != 1.0 or self.top_k != 0 or self.min_p is not None or self.repetition_penalty != 1.0:
+            raise ValueError(
+                "teacher-mixed rollout requires top_p=1.0, top_k=0, min_p=None, and repetition_penalty=1.0."
+            )
+        if self.args.generation_kwargs is not None:
+            raise ValueError("teacher-mixed rollout does not support custom generation_kwargs.")
+        if self.temperature <= 0.0:
+            raise ValueError("teacher-mixed rollout requires stochastic sampling.")
+        if self.temperature != self.kd_temperature:
+            raise ValueError("teacher-mixed rollout requires temperature == kd_temperature.")
+
+    def _prepare_teacher_mixed_generation_inputs(self, prompt_ids):
+        device = self.accelerator.device
+        pad_token_id = self._tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self._tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("MiniLLM teacher-mixed rollout requires either a pad token or an EOS token.")
+
+        eos_token_ids = self.generation_config.eos_token_id
+        if eos_token_ids is None:
+            eos_token_ids = self._tokenizer.eos_token_id
+        if eos_token_ids is None:
+            eos_token_ids = []
+        elif isinstance(eos_token_ids, int):
+            eos_token_ids = [eos_token_ids]
+        else:
+            eos_token_ids = list(eos_token_ids)
+        eos_token_ids = torch.tensor(eos_token_ids, device=device, dtype=torch.long)
+
+        prompt_tensors = [torch.tensor(ids, dtype=torch.long) for ids in prompt_ids]
+        input_ids = pad(prompt_tensors, padding_value=pad_token_id, padding_side="left").to(device=device)
+        attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left").to(
+            device=device
+        )
+        return pad_token_id, eos_token_ids, input_ids, attention_mask
+
+    @staticmethod
+    def _prepare_teacher_mixed_position_ids(model, input_ids, model_kwargs):
+        if "position_ids" not in set(inspect.signature(model.forward).parameters):
+            return
+        model_kwargs["position_ids"] = model._prepare_position_ids_for_generation(input_ids, model_kwargs)
+
+    def _teacher_mixed_generate_single_turn_full_prefix(self, prompt_ids):
+        # Test/debug helper kept to compare against the cache rollout implementation.
+        device = self.accelerator.device
+        pad_token_id, eos_token_ids, input_ids, attention_mask = self._prepare_teacher_mixed_generation_inputs(
+            prompt_ids
+        )
+
+        completion_ids = [[] for _ in prompt_ids]
+        sampled_student_logps = [[] for _ in prompt_ids]
+        sampled_mixed_logps = [[] for _ in prompt_ids]
+        unfinished = torch.ones(len(prompt_ids), dtype=torch.bool, device=device)
+
+        student_model = self.model_wrapped if self.model_wrapped is not None else self.model
+        student_was_training = student_model.training
+        teacher_was_training = self.teacher_model.training
+        student_model.eval()
+        self.teacher_model.eval()
+
+        try:
+            with torch.no_grad():
+                for _ in range(self.max_completion_length):
+                    student_logits = student_model(
+                        input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+                    ).logits[:, -1, :]
+                    teacher_logits = self.teacher_model(
+                        input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+                    ).logits[:, -1, :]
+                    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+                        raise ValueError("Teacher and student vocab sizes must match for teacher-mixed sampling.")
+
+                    student_log_probs = F.log_softmax(student_logits.float() / self.temperature, dim=-1)
+                    teacher_log_probs = F.log_softmax(teacher_logits.float() / self.temperature, dim=-1)
+                    student_probs = student_log_probs.exp()
+                    teacher_probs = teacher_log_probs.exp()
+                    mixed_probs = (
+                        1.0 - self.teacher_mixin_alpha
+                    ) * student_probs + self.teacher_mixin_alpha * teacher_probs
+                    next_token_ids = torch.multinomial(mixed_probs, 1).squeeze(1)
+                    mixed_log_probs = torch.log(mixed_probs.clamp_min(torch.finfo(mixed_probs.dtype).tiny))
+                    step_student_logps = torch.gather(
+                        student_log_probs, dim=-1, index=next_token_ids.unsqueeze(-1)
+                    ).squeeze(-1)
+                    step_mixed_logps = torch.gather(
+                        mixed_log_probs, dim=-1, index=next_token_ids.unsqueeze(-1)
+                    ).squeeze(-1)
+
+                    was_unfinished = unfinished.clone()
+                    for idx, is_unfinished in enumerate(was_unfinished.tolist()):
+                        if is_unfinished:
+                            completion_ids[idx].append(int(next_token_ids[idx].item()))
+                            sampled_student_logps[idx].append(float(step_student_logps[idx].item()))
+                            sampled_mixed_logps[idx].append(float(step_mixed_logps[idx].item()))
+
+                    active_token_ids = torch.where(
+                        was_unfinished, next_token_ids, torch.full_like(next_token_ids, pad_token_id)
+                    )
+                    input_ids = torch.cat([input_ids, active_token_ids.unsqueeze(1)], dim=1)
+                    attention_mask = torch.cat([attention_mask, was_unfinished.long().unsqueeze(1)], dim=1)
+
+                    generated_eos = torch.zeros_like(was_unfinished)
+                    if len(eos_token_ids) > 0:
+                        generated_eos = (next_token_ids.unsqueeze(1) == eos_token_ids.unsqueeze(0)).any(dim=1)
+                    unfinished = was_unfinished & ~generated_eos
+
+                    if not unfinished.any():
+                        break
+        finally:
+            if student_was_training:
+                student_model.train()
+            if teacher_was_training:
+                self.teacher_model.train()
+
+        self._last_teacher_mixed_student_logps = sampled_student_logps
+        self._last_teacher_mixed_logps = sampled_mixed_logps
+        return completion_ids, None
+
+    def _teacher_mixed_generate_single_turn_with_cache(self, prompt_ids):
+        device = self.accelerator.device
+        pad_token_id, eos_token_ids, input_ids, attention_mask = self._prepare_teacher_mixed_generation_inputs(
+            prompt_ids
+        )
+
+        completion_ids = [[] for _ in prompt_ids]
+        sampled_student_logps = [[] for _ in prompt_ids]
+        sampled_mixed_logps = [[] for _ in prompt_ids]
+        unfinished = torch.ones(len(prompt_ids), dtype=torch.bool, device=device)
+
+        student_model = self.model_wrapped if self.model_wrapped is not None else self.model
+        teacher_model = self.teacher_model
+        student_was_training = student_model.training
+        teacher_was_training = teacher_model.training
+        student_model.eval()
+        teacher_model.eval()
+
+        try:
+            student_kwargs = {
+                "attention_mask": attention_mask,
+                "use_cache": True,
+            }
+            teacher_kwargs = {
+                "attention_mask": attention_mask.clone(),
+                "use_cache": True,
+            }
+            self._prepare_teacher_mixed_position_ids(student_model, input_ids, student_kwargs)
+            self._prepare_teacher_mixed_position_ids(teacher_model, input_ids, teacher_kwargs)
+
+            with torch.no_grad():
+                student_inputs = student_model.prepare_inputs_for_generation(
+                    input_ids, is_first_iteration=True, **student_kwargs
+                )
+                teacher_inputs = teacher_model.prepare_inputs_for_generation(
+                    input_ids, is_first_iteration=True, **teacher_kwargs
+                )
+                student_outputs = student_model(**student_inputs)
+                # print(f"[DDDBUG] teacher dtype{next(teacher_model.parameters()).dtype}")
+                print(f"[DDDBUG] input shape {teacher_inputs['input_ids'].shape}")
+                teacher_outputs = teacher_model(**teacher_inputs)
+                pkv = teacher_outputs.past_key_values
+                print(f"[DDDBUG] teacher logits dtype: {teacher_outputs.logits.dtype}")
+                if student_outputs.past_key_values is None or teacher_outputs.past_key_values is None:
+                    raise ValueError(
+                        "teacher-mixed rollout requires models that return past_key_values when use_cache=True."
+                    )
+                student_logits = student_outputs.logits[:, -1, :]
+                teacher_logits = teacher_outputs.logits[:, -1, :]
+
+                for _ in range(self.max_completion_length):
+                    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+                        raise ValueError("Teacher and student vocab sizes must match for teacher-mixed sampling.")
+
+                    student_log_probs = F.log_softmax(student_logits.float() / self.temperature, dim=-1)
+                    teacher_log_probs = F.log_softmax(teacher_logits.float() / self.temperature, dim=-1)
+                    student_probs = student_log_probs.exp()
+                    teacher_probs = teacher_log_probs.exp()
+                    mixed_probs = (
+                        1.0 - self.teacher_mixin_alpha
+                    ) * student_probs + self.teacher_mixin_alpha * teacher_probs
+                    next_token_ids = torch.multinomial(mixed_probs, 1).squeeze(1)
+                    mixed_log_probs = torch.log(mixed_probs.clamp_min(torch.finfo(mixed_probs.dtype).tiny))
+                    step_student_logps = torch.gather(
+                        student_log_probs, dim=-1, index=next_token_ids.unsqueeze(-1)
+                    ).squeeze(-1)
+                    step_mixed_logps = torch.gather(
+                        mixed_log_probs, dim=-1, index=next_token_ids.unsqueeze(-1)
+                    ).squeeze(-1)
+
+                    was_unfinished = unfinished.clone()
+                    for idx, is_unfinished in enumerate(was_unfinished.tolist()):
+                        if is_unfinished:
+                            completion_ids[idx].append(int(next_token_ids[idx].item()))
+                            sampled_student_logps[idx].append(float(step_student_logps[idx].item()))
+                            sampled_mixed_logps[idx].append(float(step_mixed_logps[idx].item()))
+
+                    active_token_ids = torch.where(
+                        was_unfinished, next_token_ids, torch.full_like(next_token_ids, pad_token_id)
+                    )
+
+                    generated_eos = torch.zeros_like(was_unfinished)
+                    if len(eos_token_ids) > 0:
+                        generated_eos = (next_token_ids.unsqueeze(1) == eos_token_ids.unsqueeze(0)).any(dim=1)
+                    unfinished = was_unfinished & ~generated_eos
+
+                    input_ids = torch.cat([input_ids, active_token_ids.unsqueeze(1)], dim=1)
+                    attention_mask = torch.cat([attention_mask, was_unfinished.long().unsqueeze(1)], dim=1)
+                    student_kwargs["past_key_values"] = student_outputs.past_key_values
+                    teacher_kwargs["past_key_values"] = teacher_outputs.past_key_values
+                    student_kwargs["attention_mask"] = attention_mask
+                    teacher_kwargs["attention_mask"] = attention_mask.clone()
+                    self._prepare_teacher_mixed_position_ids(student_model, input_ids, student_kwargs)
+                    self._prepare_teacher_mixed_position_ids(teacher_model, input_ids, teacher_kwargs)
+
+                    if not unfinished.any():
+                        break
+
+                    student_inputs = student_model.prepare_inputs_for_generation(
+                        input_ids,
+                        next_sequence_length=1,
+                        **student_kwargs,
+                    )
+                    teacher_inputs = teacher_model.prepare_inputs_for_generation(
+                        input_ids,
+                        next_sequence_length=1,
+                        **teacher_kwargs,
+                    )
+                    student_outputs = student_model(**student_inputs)
+                    teacher_outputs = teacher_model(**teacher_inputs)
+                    student_logits = student_outputs.logits[:, -1, :]
+                    teacher_logits = teacher_outputs.logits[:, -1, :]
+        finally:
+            if student_was_training:
+                student_model.train()
+            if teacher_was_training:
+                teacher_model.train()
+
+        self._last_teacher_mixed_student_logps = sampled_student_logps
+        self._last_teacher_mixed_logps = sampled_mixed_logps
+
+        print(
+            f"[DDDBUG] alloc {torch.cuda.memory_allocated() / 1024**3} reserved {torch.cuda.memory_reserved() / 1024**3}"
+        )
+        return completion_ids, None
+
+    def _teacher_mixed_generate_single_turn(self, prompt_ids, images=None, multimodal_fields=None):
+        multimodal_fields = {} if multimodal_fields is None else multimodal_fields
+        self._validate_teacher_mixed_rollout(images, multimodal_fields)
+        return self._teacher_mixed_generate_single_turn_with_cache(prompt_ids)
+
+    def _generate_single_turn(self, prompt_ids, images, multimodal_fields):
+        if self.teacher_mixin_alpha == 0.0:
+            return super()._generate_single_turn(prompt_ids, images, multimodal_fields)
+        return self._teacher_mixed_generate_single_turn(prompt_ids, images, multimodal_fields)
+
+    def _generate_and_score_completions(self, inputs):
+        output = super()._generate_and_score_completions(inputs)
+        if self.teacher_mixin_alpha == 0.0:
+            return output
+
+        teacher_mixed_student_logps = self._last_teacher_mixed_student_logps
+        teacher_mixed_logps = self._last_teacher_mixed_logps
+        self._last_teacher_mixed_student_logps = None
+        self._last_teacher_mixed_logps = None
+        if teacher_mixed_student_logps is None or teacher_mixed_logps is None:
+            raise RuntimeError("MiniLLM teacher-mixed rollout did not record sampling log-probabilities.")
+
+        device = self.accelerator.device
+        teacher_mixed_student_logps = [torch.tensor(logps) for logps in teacher_mixed_student_logps]
+        teacher_mixed_logps = [torch.tensor(logps) for logps in teacher_mixed_logps]
+        teacher_mixed_student_logps = pad(
+            teacher_mixed_student_logps,
+            padding_value=0.0,
+            padding_side="right",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device=device)
+        teacher_mixed_logps = pad(
+            teacher_mixed_logps,
+            padding_value=0.0,
+            padding_side="right",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        ).to(device=device)
+        teacher_mixed_importance_weights = torch.exp(teacher_mixed_student_logps - teacher_mixed_logps)
+        output["teacher_mixed_logps"] = teacher_mixed_logps
+        output["old_per_token_logps"] = teacher_mixed_logps
+        output["teacher_mixed_importance_weights"] = teacher_mixed_importance_weights
+        if output["teacher_mixed_logps"].shape != output["completion_mask"].shape:
+            raise RuntimeError("teacher_mixed_logps and completion_mask must have the same shape.")
+        if output["old_per_token_logps"].shape != output["completion_mask"].shape:
+            raise RuntimeError("old_per_token_logps and completion_mask must have the same shape.")
+        return output
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
         attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
 
         # Compute student output
         student_outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -364,6 +717,8 @@ class MiniLLMTrainer(GRPOTrainer):
         prompt_lengths = inputs["prompt_ids"].shape[1]
         student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
         teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
+        if student_logits.shape[-1] != teacher_logits.shape[-1]:
+            raise ValueError("Teacher and student vocab sizes must match for MiniLLM distillation.")
         shifted_labels = input_ids[:, prompt_lengths:]
 
         # Apply temperature scaling
@@ -381,18 +736,39 @@ class MiniLLMTrainer(GRPOTrainer):
             teacher_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
         ).squeeze(-1)
 
-        mask = shifted_labels != -100
+        mask = inputs["completion_mask"].bool()
+        if "tool_mask" in inputs:
+            mask = mask & inputs["tool_mask"].bool()
+        assert mask.shape == student_log_probs_on_labels.shape
 
+        teacher_mixed_logps = inputs.get("teacher_mixed_logps")
+        if teacher_mixed_logps is not None:
+            assert teacher_mixed_logps.shape == mask.shape
+            teacher_mixed_importance_weights = torch.exp(student_log_probs_on_labels.detach() - teacher_mixed_logps)
+        else:
+            teacher_mixed_importance_weights = inputs.get("teacher_mixed_importance_weights")
+            if teacher_mixed_importance_weights is not None:
+                assert teacher_mixed_importance_weights.shape == mask.shape
+        if teacher_mixed_importance_weights is not None:
+            if self.teacher_mixin_importance_clip is not None:
+                teacher_mixed_importance_weights = teacher_mixed_importance_weights.clamp(
+                    max=self.teacher_mixin_importance_clip
+                )
+            teacher_mixed_importance_weights = teacher_mixed_importance_weights * mask.float()
+        
         if self.rkl_advantage:
             reverse_kl_advantage = self._compute_advantage(
                 student_log_probs_on_labels=student_log_probs_on_labels,
                 teacher_log_probs_on_labels=teacher_log_probs_on_labels,
                 mask=mask,
             )
+        
+        inputs["advantages"] = reverse_kl_advantage.detach()
 
-            inputs["advantages"] = inputs["advantages"].unsqueeze(1) + reverse_kl_advantage
+        if teacher_mixed_logps is not None and "old_per_token_logps" not in inputs:
+            inputs["old_per_token_logps"] = teacher_mixed_logps
 
-        # Compute GRPO loss on verifiable reward
+        # Compute the GRPO surrogate on the OPD advantages.
         loss = self._compute_loss(model, inputs)
 
         # Compute loss
@@ -401,6 +777,7 @@ class MiniLLMTrainer(GRPOTrainer):
                 student_log_probs=student_log_probs,
                 teacher_log_probs=teacher_log_probs,
                 mask=mask,
+                importance_weights=teacher_mixed_importance_weights,
             )
 
             loss += single_step_decomposition_loss
