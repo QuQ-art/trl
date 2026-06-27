@@ -20,12 +20,28 @@ L_{\text{MiniLLM}}&=\alpha_1\mathbb{E}_{x\sim \pi_{\theta}}\sum_{t'=t}^{|x|}\fra
 \end{align}
 $$
 
+`MiniLLMTrainer` runs in pure OPD mode: external `reward_funcs` are not supported, and the GRPO reward path is only
+kept as an internal placeholder while the training signal comes from MiniLLM reverse-KL terms.
+
+By default, the trainer keeps the original TRL pure-student rollout behavior with `teacher_mixin_alpha=0.0`. To use
+teacher-mixed rollouts, set `teacher_mixin_alpha=0.2` so tokens are sampled from
+`teacher_mixin_alpha * p_teacher + (1 - teacher_mixin_alpha) * q_student`. For teacher-mixed rollouts, the behavior
+log-probabilities are used as `old_per_token_logps`, so the long-term policy-gradient surrogate applies the
+`q_student / p_mixed` correction. The single-step KL term remains the exact vocabulary-level
+`KL(q_student || p_teacher)` term and is not scaled by sampled-token importance weights, matching the public MiniLLM
+implementation. The deprecated `teacher_mixin_importance_clip` argument is kept for compatibility and does not affect
+the single-step KL term.
+
+Teacher-mixed rollouts require the teacher and student distributions to share the same token-id space. Use models with
+matching tokenizers when enabling `teacher_mixin_alpha > 0.0`.
+
 When  \\( \alpha_1=1 \\), \\( \alpha_2=0 \\), \\( \gamma=0 \\), which corresponds to
 
 ```python
 from trl.experimental.minillm import MiniLLMConfig
 
 training_args = MiniLLMConfig(
+    teacher_mixin_alpha=0.2,
     rkl_advantage=True,
     single_step_decomposition=False,
     gamma=False
@@ -44,6 +60,7 @@ When \\( \alpha_1=0 \\), \\( \alpha_2=1 \\), which corresponds to
 from trl.experimental.minillm import MiniLLMConfig
 
 training_args = MiniLLMConfig(
+    teacher_mixin_alpha=0.2,
     rkl_advantage=False,
     single_step_decomposition=True
 )

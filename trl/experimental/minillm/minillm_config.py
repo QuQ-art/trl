@@ -45,8 +45,8 @@ class MiniLLMConfig(GRPOConfig):
             `teacher_mixin_alpha * p_teacher + (1 - teacher_mixin_alpha) * q_student`, following the paper. Set to
             `0.0` to keep the original TRL pure-student rollout behavior.
         teacher_mixin_importance_clip (`float`, *optional*, defaults to `10.0`):
-            Maximum importance weight applied to the single-step MiniLLM term during teacher-mixed training. If set to
-            `None`, no clipping is applied.
+            Deprecated compatibility argument. Teacher-mixed correction is applied through the behavior log-probabilities
+            in the policy-gradient surrogate; the single-step KL term is not importance-weighted.
         gamma (`float`, *optional*, defaults to `0.0`):
             Discount factor for future rewards in reinforcement learning.
         length_normalization (`bool`, *optional*, defaults to `True`):
@@ -90,7 +90,7 @@ class MiniLLMConfig(GRPOConfig):
     )
     teacher_mixin_importance_clip: float | None = field(
         default=10.0,
-        metadata={"help": "Maximum importance weight for the teacher-mixed single-step MiniLLM loss."},
+        metadata={"help": "Deprecated compatibility argument; teacher-mixed single-step KL is not importance-weighted."},
     )
     gamma: float = field(
         default=0.0,

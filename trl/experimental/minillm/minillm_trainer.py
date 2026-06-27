@@ -181,6 +181,8 @@ class MiniLLMTrainer(GRPOTrainer):
     ):
         if reward_funcs is None:
             reward_funcs = [dummy_reward_func]
+        else:
+            raise ValueError("MiniLLMTrainer supports pure OPD only; reward_funcs must be None.")
 
         # Args
         if args is None:
@@ -265,7 +267,6 @@ class MiniLLMTrainer(GRPOTrainer):
         self.teacher_mixin_importance_clip = args.teacher_mixin_importance_clip
         self.single_step_decomposition = args.single_step_decomposition
         self.rkl_advantage = args.rkl_advantage
-        assert self.rkl_advantage, "As for miniLLM trainer, rkl_advantage must be true"
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
 
@@ -278,7 +279,6 @@ class MiniLLMTrainer(GRPOTrainer):
         student_log_probs: torch.Tensor,
         teacher_log_probs: torch.Tensor,
         mask: torch.Tensor | None = None,
-        importance_weights: torch.Tensor | None = None,
         reduction: str = "batchmean",
     ):
         """
@@ -304,9 +304,6 @@ class MiniLLMTrainer(GRPOTrainer):
             loss: Scalar tensor with the generalized JSD loss
         """
         reg_loss = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True).sum(dim=-1)
-
-        if importance_weights is not None:
-            reg_loss = reg_loss * importance_weights
 
         # Masking
         if mask is not None:
@@ -691,10 +688,8 @@ class MiniLLMTrainer(GRPOTrainer):
             padding_side="right",
             pad_to_multiple_of=self.pad_to_multiple_of,
         ).to(device=device)
-        teacher_mixed_importance_weights = torch.exp(teacher_mixed_student_logps - teacher_mixed_logps)
         output["teacher_mixed_logps"] = teacher_mixed_logps
         output["old_per_token_logps"] = teacher_mixed_logps
-        output["teacher_mixed_importance_weights"] = teacher_mixed_importance_weights
         if output["teacher_mixed_logps"].shape != output["completion_mask"].shape:
             raise RuntimeError("teacher_mixed_logps and completion_mask must have the same shape.")
         if output["old_per_token_logps"].shape != output["completion_mask"].shape:
@@ -744,26 +739,16 @@ class MiniLLMTrainer(GRPOTrainer):
         teacher_mixed_logps = inputs.get("teacher_mixed_logps")
         if teacher_mixed_logps is not None:
             assert teacher_mixed_logps.shape == mask.shape
-            teacher_mixed_importance_weights = torch.exp(student_log_probs_on_labels.detach() - teacher_mixed_logps)
-        else:
-            teacher_mixed_importance_weights = inputs.get("teacher_mixed_importance_weights")
-            if teacher_mixed_importance_weights is not None:
-                assert teacher_mixed_importance_weights.shape == mask.shape
-        if teacher_mixed_importance_weights is not None:
-            if self.teacher_mixin_importance_clip is not None:
-                teacher_mixed_importance_weights = teacher_mixed_importance_weights.clamp(
-                    max=self.teacher_mixin_importance_clip
-                )
-            teacher_mixed_importance_weights = teacher_mixed_importance_weights * mask.float()
-        
+
         if self.rkl_advantage:
             reverse_kl_advantage = self._compute_advantage(
                 student_log_probs_on_labels=student_log_probs_on_labels,
                 teacher_log_probs_on_labels=teacher_log_probs_on_labels,
                 mask=mask,
             )
-        
-        inputs["advantages"] = reverse_kl_advantage.detach()
+            inputs["advantages"] = reverse_kl_advantage.detach()
+        else:
+            inputs["advantages"] = torch.zeros_like(student_log_probs_on_labels)
 
         if teacher_mixed_logps is not None and "old_per_token_logps" not in inputs:
             inputs["old_per_token_logps"] = teacher_mixed_logps
@@ -777,7 +762,6 @@ class MiniLLMTrainer(GRPOTrainer):
                 student_log_probs=student_log_probs,
                 teacher_log_probs=teacher_log_probs,
                 mask=mask,
-                importance_weights=teacher_mixed_importance_weights,
             )
 
             loss += single_step_decomposition_loss
