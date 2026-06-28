@@ -656,14 +656,17 @@ class MiniLLMTrainer(GRPOTrainer):
         self._validate_teacher_mixed_rollout(images, multimodal_fields)
         return self._teacher_mixed_generate_single_turn_with_cache(prompt_ids)
 
+    def _use_teacher_mixed_rollout(self):
+        return self.teacher_mixin_alpha > 0.0 and self.model.training
+
     def _generate_single_turn(self, prompt_ids, images, multimodal_fields):
-        if self.teacher_mixin_alpha == 0.0:
+        if not self._use_teacher_mixed_rollout():
             return super()._generate_single_turn(prompt_ids, images, multimodal_fields)
         return self._teacher_mixed_generate_single_turn(prompt_ids, images, multimodal_fields)
 
     def _generate_and_score_completions(self, inputs):
         output = super()._generate_and_score_completions(inputs)
-        if self.teacher_mixin_alpha == 0.0:
+        if not self._use_teacher_mixed_rollout():
             return output
 
         teacher_mixed_student_logps = self._last_teacher_mixed_student_logps
