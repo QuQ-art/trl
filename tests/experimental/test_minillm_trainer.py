@@ -346,6 +346,7 @@ def test_teacher_mixed_generate_single_turn_records_eos_once_and_stops(monkeypat
 def test_generate_and_score_completions_uses_teacher_mixed_logps_as_behavior_logps(monkeypatch):
     trainer = MiniLLMTrainer.__new__(MiniLLMTrainer)
     trainer.teacher_mixin_alpha = 0.2
+    trainer.model = SimpleNamespace(training=True)
     trainer.accelerator = DummyAccelerator()
     trainer.pad_to_multiple_of = None
     trainer._last_teacher_mixed_student_logps = [[-0.2, -0.7]]
@@ -366,6 +367,48 @@ def test_generate_and_score_completions_uses_teacher_mixed_logps_as_behavior_log
     assert output["old_per_token_logps"].shape == output["completion_mask"].shape
     assert trainer._last_teacher_mixed_student_logps is None
     assert trainer._last_teacher_mixed_logps is None
+
+
+def test_generate_single_turn_uses_student_only_rollout_during_eval(monkeypatch):
+    trainer = MiniLLMTrainer.__new__(MiniLLMTrainer)
+    trainer.teacher_mixin_alpha = 0.2
+    trainer.model = SimpleNamespace(training=False)
+    calls = {"student": 0, "teacher_mixed": 0}
+
+    def fake_student_generate_single_turn(self, prompt_ids, images, multimodal_fields):
+        calls["student"] += 1
+        return [[2]], [[-0.1]]
+
+    def fake_teacher_mixed_generate_single_turn(self, prompt_ids, images, multimodal_fields):
+        calls["teacher_mixed"] += 1
+        return [[3]], None
+
+    monkeypatch.setattr(GRPOTrainer, "_generate_single_turn", fake_student_generate_single_turn)
+    monkeypatch.setattr(MiniLLMTrainer, "_teacher_mixed_generate_single_turn", fake_teacher_mixed_generate_single_turn)
+
+    completion_ids, logps = trainer._generate_single_turn([[1]], None, {})
+
+    assert completion_ids == [[2]]
+    assert logps == [[-0.1]]
+    assert calls == {"student": 1, "teacher_mixed": 0}
+
+
+def test_generate_and_score_completions_ignores_teacher_mixed_logps_during_eval(monkeypatch):
+    trainer = MiniLLMTrainer.__new__(MiniLLMTrainer)
+    trainer.teacher_mixin_alpha = 0.2
+    trainer.model = SimpleNamespace(training=False)
+    trainer._last_teacher_mixed_student_logps = [[-0.2]]
+    trainer._last_teacher_mixed_logps = [[-0.4]]
+
+    def fake_generate_and_score_completions(self, inputs):
+        return {"completion_mask": torch.tensor([[1]]), "old_per_token_logps": torch.tensor([[-0.1]])}
+
+    monkeypatch.setattr(GRPOTrainer, "_generate_and_score_completions", fake_generate_and_score_completions)
+
+    output = trainer._generate_and_score_completions(inputs=[])
+
+    assert "teacher_mixed_logps" not in output
+    assert torch.allclose(output["old_per_token_logps"], torch.tensor([[-0.1]]))
 
 
 def test_compute_advantage_is_future_only():
