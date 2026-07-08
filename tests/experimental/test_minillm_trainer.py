@@ -417,12 +417,13 @@ def test_compute_advantage_is_future_only():
     trainer.length_normalization = False
 
     advantages = trainer._compute_advantage(
-        student_log_probs_on_labels=torch.zeros((1, 3)),
+        student_log_probs_on_labels=torch.zeros((1, 3), requires_grad=True),
         teacher_log_probs_on_labels=torch.tensor([[1.0, 2.0, 3.0]]),
         mask=torch.tensor([[True, True, True]]),
     )
 
     assert torch.allclose(advantages, torch.tensor([[5.0, 3.0, 0.0]]))
+    assert not advantages.requires_grad
 
 
 def test_compute_loss_uses_completion_mask_without_weighting_single_step_kl():
