@@ -319,6 +319,7 @@ class MiniLLMTrainer(GRPOTrainer):
         else:
             return reg_loss
 
+    @torch.no_grad()
     def _compute_advantage(
         self,
         student_log_probs_on_labels: torch.Tensor,
@@ -749,7 +750,7 @@ class MiniLLMTrainer(GRPOTrainer):
                 teacher_log_probs_on_labels=teacher_log_probs_on_labels,
                 mask=mask,
             )
-            inputs["advantages"] = reverse_kl_advantage.detach()
+            inputs["advantages"] = reverse_kl_advantage
         else:
             inputs["advantages"] = torch.zeros_like(student_log_probs_on_labels)
 
@@ -767,7 +768,8 @@ class MiniLLMTrainer(GRPOTrainer):
                 mask=mask,
             )
 
-            loss += single_step_decomposition_loss
+            accumulation_scale = getattr(self, "current_gradient_accumulation_steps", 1) if model.training else 1.0
+            loss += single_step_decomposition_loss / accumulation_scale
 
         # Empty cache
         empty_cache()
