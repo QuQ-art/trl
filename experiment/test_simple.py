@@ -58,7 +58,7 @@ print("len(train_dataloader):", len(train_dl))
 print("generation_batch_size:", getattr(trainer.args, "generation_batch_size", None))
 print("steps_per_generation:", getattr(trainer.args, "steps_per_generation", None))
 print("num_generations:", getattr(trainer.args, "num_generations", None))
-
+print("teacher_mixin_alpha", getattr(trainer.args, "teacher_mixin_alpha", None))
 
 
 trainer.train()
