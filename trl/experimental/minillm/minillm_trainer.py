@@ -564,11 +564,7 @@ class MiniLLMTrainer(GRPOTrainer):
                     input_ids, is_first_iteration=True, **teacher_kwargs
                 )
                 student_outputs = student_model(**student_inputs)
-                # print(f"[DDDBUG] teacher dtype{next(teacher_model.parameters()).dtype}")
-                print(f"[DDDBUG] input shape {teacher_inputs['input_ids'].shape}")
                 teacher_outputs = teacher_model(**teacher_inputs)
-                pkv = teacher_outputs.past_key_values
-                print(f"[DDDBUG] teacher logits dtype: {teacher_outputs.logits.dtype}")
                 if student_outputs.past_key_values is None or teacher_outputs.past_key_values is None:
                     raise ValueError(
                         "teacher-mixed rollout requires models that return past_key_values when use_cache=True."
@@ -646,10 +642,6 @@ class MiniLLMTrainer(GRPOTrainer):
 
         self._last_teacher_mixed_student_logps = sampled_student_logps
         self._last_teacher_mixed_logps = sampled_mixed_logps
-
-        print(
-            f"[DDDBUG] alloc {torch.cuda.memory_allocated() / 1024**3} reserved {torch.cuda.memory_reserved() / 1024**3}"
-        )
         return completion_ids, None
 
     def _teacher_mixed_generate_single_turn(self, prompt_ids, images=None, multimodal_fields=None):

@@ -1,0 +1,75 @@
+{
+  "experiment": "qwen_dolly_v2",
+  "seed": 42,
+  "data": {
+    "train_original": 1000,
+    "train_after_prompt_filter": 989,
+    "valid": 200,
+    "test": 200
+  },
+  "evaluation_protocol": "dolly_eval_v1",
+  "valid": {
+    "sft_student": {
+      "rouge_l": 0.272777243523538,
+      "classification_accuracy": 0.058823529411764705,
+      "completion_truncated_examples": 55
+    },
+    "sft_teacher": {
+      "rouge_l": 0.3509535156848389,
+      "classification_accuracy": 0.08823529411764706,
+      "completion_truncated_examples": 19
+    },
+    "minillm_alpha_0.0": {
+      "selected_step": 200,
+      "rouge_l": 0.32669962985550344,
+      "classification_accuracy": 0.058823529411764705,
+      "completion_truncated_examples": 17,
+      "checkpoint_curve": {
+        "200": 0.32669962985550344,
+        "400": 0.32520911819362525,
+        "600": 0.3042355625805698,
+        "800": 0.32203026768591764,
+        "1000": 0.32481995779187556
+      }
+    },
+    "minillm_alpha_0.2": {
+      "selected_step": 1000,
+      "rouge_l": 0.32240395300475433,
+      "classification_accuracy": 0.08823529411764706,
+      "completion_truncated_examples": 18,
+      "checkpoint_curve": {
+        "200": 0.3199621166508068,
+        "400": 0.3132198858577061,
+        "600": 0.3165890855104132,
+        "800": 0.3179371964747965,
+        "1000": 0.32240395300475433
+      }
+    }
+  },
+  "test": {
+    "sft_student": {
+      "rouge_l": 0.2916239573671741,
+      "classification_accuracy": 0.0,
+      "classification_examples": 33,
+      "completion_truncated_examples": 42
+    },
+    "minillm_alpha_0.0": {
+      "selected_step": 200,
+      "rouge_l": 0.3352027199928277,
+      "classification_accuracy": 0.09090909090909091,
+      "classification_examples": 33,
+      "completion_truncated_examples": 11
+    },
+    "minillm_alpha_0.2": {
+      "selected_step": 1000,
+      "rouge_l": 0.32972176187355573,
+      "classification_accuracy": 0.06060606060606061,
+      "classification_examples": 33,
+      "completion_truncated_examples": 13
+    }
+  },
+  "test_delta_alpha_0.2_minus_0.0": {
+    "rouge_l": -0.005480958119271974,
+    "rouge_l_points": -0.5480958119271974
+  }
+}

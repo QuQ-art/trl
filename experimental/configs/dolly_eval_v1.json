@@ -1,0 +1,12 @@
+{
+  "name": "dolly_eval_v1",
+  "data_format": "Dolly plain-text prompt",
+  "do_sample": false,
+  "max_input_length": 8192,
+  "max_new_tokens": 256,
+  "stop_string": "\n\n###",
+  "seed": 42,
+  "primary_metric": "mean Rouge-L F1",
+  "secondary_metric": "classification normalized exact-match accuracy",
+  "test_policy": "Run test once after training and checkpoint-selection rules are frozen"
+}
