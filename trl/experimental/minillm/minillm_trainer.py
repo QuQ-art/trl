@@ -34,6 +34,7 @@ from ...trainer.grpo_trainer import GRPOTrainer, RewardFunc, RolloutFunc
 from ...trainer.utils import disable_dropout_in_model, get_config_model_id
 from ..utils import empty_cache
 from .minillm_config import MiniLLMConfig
+from .vllm_helper import TeacherVLLM
 
 
 if is_peft_available():
@@ -54,13 +55,14 @@ class MiniLLMTrainer(GRPOTrainer):
 
     ```python
     >>> from datasets import load_dataset
-    >>> from trl.experimental.minillm import MiniLLMTrainer
+    >>> from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
 
     >>> dataset = load_dataset("trl-lib/tldr", split="train")
 
     >>> trainer = MiniLLMTrainer(
     ...     model="Qwen/Qwen3-0.6B",
     ...     teacher_model="Qwen/Qwen3-1.7B",
+    ...     args=MiniLLMConfig(use_vllm=True, use_vllm_teacher=True),
     ...     train_dataset=dataset,
     ... )
     >>> trainer.train()
@@ -195,6 +197,31 @@ class MiniLLMTrainer(GRPOTrainer):
             args.gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
             args.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
 
+        if args.use_vllm_teacher:
+            if not isinstance(teacher_model, str):
+                raise ValueError("teacher_model must be a model ID or path when use_vllm_teacher=True.")
+        else:
+            if args.teacher_model_init_kwargs is None:
+                teacher_model_init_kwargs = {}
+            elif not isinstance(teacher_model, str):
+                raise ValueError(
+                    "You passed teacher_model_init_kwargs to the MiniLLMConfig, but your teacher_model is already instantiated."
+                )
+            else:
+                teacher_model_init_kwargs = args.teacher_model_init_kwargs
+                teacher_model_init_kwargs["dtype"] = (
+                    teacher_model_init_kwargs["dtype"]
+                    if teacher_model_init_kwargs["dtype"] in ["auto", None]
+                    else getattr(torch, teacher_model_init_kwargs["dtype"])
+                )
+
+            if isinstance(teacher_model, str):
+                teacher_model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
+                # GRPO initializes the student vLLM engine in `super().__init__`. vLLM registers its own config
+                # classes in the global Transformers AutoConfig registry, so instantiate the local teacher first to
+                # ensure Transformers resolves the original config and model classes.
+                teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
+
         super().__init__(
             model,
             reward_funcs,
@@ -209,32 +236,17 @@ class MiniLLMTrainer(GRPOTrainer):
             rollout_func=rollout_func,
         )
 
-        if args.teacher_model_init_kwargs is None:
-            teacher_model_init_kwargs = {}
-        elif not isinstance(teacher_model, str):
-            raise ValueError(
-                "You passed teacher_model_init_kwargs to the MiniLLMConfig, but your teacher_model is already instantiated."
-            )
+        self.teacher_vllm = None
+        if args.use_vllm_teacher:
+            if self.accelerator.num_processes != 1:
+                raise ValueError("Automatically managed teacher vLLM currently supports single-process training only.")
+            self.teacher_model = None
+            self.teacher_vllm = TeacherVLLM(teacher_model, args)
         else:
-            teacher_model_init_kwargs = args.teacher_model_init_kwargs
-            teacher_model_init_kwargs["dtype"] = (
-                teacher_model_init_kwargs["dtype"]
-                if teacher_model_init_kwargs["dtype"] in ["auto", None]
-                else getattr(torch, teacher_model_init_kwargs["dtype"])
-            )
-
-        if isinstance(teacher_model, str):
-            teacher_model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
-            teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
-
-        # Disable dropout in the model
-        if args.disable_dropout:
-            disable_dropout_in_model(self.model)
-
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
 
         self.temperature = args.temperature
         self.kd_temperature = args.kd_temperature
@@ -349,39 +361,50 @@ class MiniLLMTrainer(GRPOTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
         attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
 
         # Compute student output
         student_outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
         # Compute teacher output in eval mode
-        self.teacher_model.eval()
-        with torch.no_grad():
-            teacher_outputs = self.teacher_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        if self.teacher_vllm is None:
+            self.teacher_model.eval()
+            with torch.no_grad():
+                teacher_outputs = self.teacher_model(
+                    input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+                )
 
         # Slice the logits for the generated tokens using the inputs["prompts"] lengths
         prompt_lengths = inputs["prompt_ids"].shape[1]
         student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
-        teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
+        if self.teacher_vllm is None:
+            teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
         shifted_labels = input_ids[:, prompt_lengths:]
 
         # Apply temperature scaling
         student_logits = student_logits / self.kd_temperature
-        teacher_logits = teacher_logits / self.kd_temperature
+        if self.teacher_vllm is None:
+            teacher_logits = teacher_logits / self.kd_temperature
 
         # Compute log probabilities for student and probabilities for teacher
         student_log_probs = F.log_softmax(student_logits, dim=-1)
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        if self.teacher_vllm is None:
+            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
         student_log_probs_on_labels = torch.gather(
             student_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
         ).squeeze(-1)
-        teacher_log_probs_on_labels = torch.gather(
-            teacher_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
-        ).squeeze(-1)
 
-        mask = shifted_labels != -100
+        if self.teacher_vllm is not None:
+            teacher_log_probs = None
+            teacher_log_probs_on_labels = self.teacher_vllm.get_log_probs(inputs, self.kd_temperature).to(
+                student_log_probs_on_labels.dtype
+            )
+        else:
+            teacher_log_probs_on_labels = torch.gather(
+                teacher_log_probs, dim=-1, index=shifted_labels.unsqueeze(-1)
+            ).squeeze(-1)
+
+        mask = inputs["completion_mask"].bool()
 
         if self.rkl_advantage:
             reverse_kl_advantage = self._compute_advantage(
