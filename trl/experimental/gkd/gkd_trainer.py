@@ -51,6 +51,15 @@ if is_peft_available():
 logger = get_logger(__name__)
 
 
+class _DataCollatorForMOPD(DataCollatorForChatML):
+    def __call__(self, examples):
+        if any("teacher_id" not in example or type(example["teacher_id"]) is not int for example in examples):
+            raise ValueError("MOPD requires an integer teacher_id in every example.")
+        batch = super().__call__(examples)
+        batch["teacher_id"] = torch.tensor([example["teacher_id"] for example in examples], dtype=torch.long)
+        return batch
+
+
 class GKDTrainer(SFTTrainer):
     """Trainer for Generalized Knowledge Distillation (GKD) of language models.
 
@@ -89,6 +98,11 @@ class GKDTrainer(SFTTrainer):
             wrapped with the specified PEFT adapter.
         formatting_func (`Callable`, *optional*):
             Function to format the dataset. Must take in an example and return an example.
+        teacher_models (`dict[int, PreTrainedModel or str]`, *optional*):
+            Frozen domain teachers for multi-teacher on-policy distillation (MOPD). Each example's integer
+            `teacher_id` selects one teacher. Mutually exclusive with `teacher_model`. Requires one device,
+            batch size 1, `lmbda=1.0`, and `seq_kd=False`. Teachers are stored on CPU; only the selected teacher
+            is moved to the training device. Custom collators must preserve `teacher_id` as an integer tensor.
     """
 
     _tag_names = ["trl", "gkd"]
@@ -127,12 +141,20 @@ class GKDTrainer(SFTTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: "PeftConfig | None" = None,
         formatting_func: Callable | None = None,
+        teacher_models: dict[int, PreTrainedModel | nn.Module | str] | None = None,
     ):
+        if teacher_models is not None:
+            if teacher_model is not None or not teacher_models or any(type(key) is not int for key in teacher_models):
+                raise ValueError("Pass a nonempty integer-keyed teacher_models mapping instead of teacher_model.")
+            if args.lmbda != 1.0 or args.seq_kd or args.per_device_train_batch_size != 1:
+                raise ValueError("MOPD requires lmbda=1.0, seq_kd=False, and per_device_train_batch_size=1.")
+
         # Ensure Trainer does not drop non-signature columns used by the collator (e.g., "prompts")
         args.remove_unused_columns = False
         # Respect a user-provided data_collator; otherwise, provide a ChatML collator that
         if data_collator is None:
-            data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
+            collator_class = DataCollatorForChatML if teacher_models is None else _DataCollatorForMOPD
+            data_collator = collator_class(tokenizer=processing_class, max_length=args.max_length)
 
         # Ensure SFTTrainer does not pre-process the dataset when using a ChatML collator,
         # so that raw conversational fields (e.g., "messages") remain available to the collator.
@@ -156,7 +178,39 @@ class GKDTrainer(SFTTrainer):
             formatting_func=formatting_func,
         )
 
-        if args.teacher_model_init_kwargs is None:
+        self.teacher_models = None
+        self._active_teacher_id = None
+        if teacher_models is not None:
+            if (
+                self.accelerator.num_processes != 1
+                or args.n_gpu > 1
+                or self.is_deepspeed_enabled
+                or self.is_fsdp_enabled
+            ):
+                raise ValueError("MOPD currently supports one device without DeepSpeed or FSDP.")
+            self.teacher_models = {}
+            for teacher_id, teacher in teacher_models.items():
+                if isinstance(teacher, str):
+                    init_kwargs = dict(args.teacher_model_init_kwargs or {})
+                    if init_kwargs.get("device_map") is not None or init_kwargs.get("quantization_config") is not None:
+                        raise ValueError("MOPD teacher offloading requires unquantized models without device_map.")
+                    init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
+                    teacher = AutoModelForCausalLM.from_pretrained(teacher, **init_kwargs)
+                elif args.teacher_model_init_kwargs is not None:
+                    raise ValueError("teacher_model_init_kwargs cannot be used with instantiated teachers.")
+                if teacher is self.model:
+                    raise ValueError("MOPD teachers must be separate from the trainable student.")
+                if teacher.config.get_text_config().vocab_size != self.model.config.get_text_config().vocab_size:
+                    raise ValueError(f"Teacher {teacher_id} and student must have the same vocab_size.")
+                teacher.requires_grad_(False)
+                teacher.eval()
+                teacher = teacher.to("cpu")
+                # Match the single-teacher autocast and output precision without moving every teacher to the device.
+                self.teacher_models[teacher_id] = self.accelerator.prepare_model(
+                    teacher, device_placement=False, evaluation_mode=True
+                )
+            self.teacher_model = None
+        elif args.teacher_model_init_kwargs is None:
             teacher_model_init_kwargs = {}
         elif not isinstance(teacher_model, str):
             raise ValueError(
@@ -170,39 +224,46 @@ class GKDTrainer(SFTTrainer):
                 else getattr(torch, teacher_model_init_kwargs["dtype"])
             )
 
-        if isinstance(teacher_model, str):
+        if teacher_models is None and isinstance(teacher_model, str):
             teacher_model_init_kwargs.setdefault("trust_remote_code", args.trust_remote_code)
             teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
 
-        student_vocab_size = self.model.config.get_text_config().vocab_size
-        teacher_vocab_size = teacher_model.config.get_text_config().vocab_size
-        if student_vocab_size != teacher_vocab_size:
-            raise ValueError(
-                f"The student model has vocab_size {student_vocab_size} but the teacher model has "
-                f"vocab_size {teacher_vocab_size}. GKD compares the teacher's full next-token "
-                f"distribution, which requires a shared vocabulary. Use a teacher with the same vocab_size, or "
-                f"GOLD for cross-tokenizer distillation."
-            )
+        if teacher_models is None:
+            student_vocab_size = self.model.config.get_text_config().vocab_size
+            teacher_vocab_size = teacher_model.config.get_text_config().vocab_size
+            if student_vocab_size != teacher_vocab_size:
+                raise ValueError(
+                    f"The student model has vocab_size {student_vocab_size} but the teacher model has "
+                    f"vocab_size {teacher_vocab_size}. GKD compares the teacher's full next-token "
+                    f"distribution, which requires a shared vocabulary. Use a teacher with the same vocab_size, or "
+                    f"GOLD for cross-tokenizer distillation."
+                )
 
         # Disable dropout in the model
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
-        else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+        if teacher_models is None:
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
 
         self.lmbda = args.lmbda
         self.beta = args.beta
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
 
+        # Generated completions replace the labels after Trainer counts tokens for gradient accumulation.
+        # Use the mean over each microbatch's actual completion tokens, then let Trainer average microbatches.
+        if self.lmbda > 0 or self.seq_kd:
+            self.model_accepts_loss_kwargs = False
+
         # With `lmbda=1.0` training is fully on-policy and `seq_kd` is never reached, and with `temperature=1.0` the
         # sampling temperature matches the one `DistillationTrainer` also applies to the divergence. In that setting,
         # `DistillationTrainer` covers this run and additionally supports vLLM generation and a chunked loss that
         # never materializes the full logits.
-        if self.lmbda == 1.0 and self.temperature == 1.0:
+        if self.teacher_models is None and self.lmbda == 1.0 and self.temperature == 1.0:
             logger.warning(
                 "This GKD configuration (`lmbda=1.0`, `temperature=1.0`) is fully covered by `DistillationTrainer`, "
                 "which is maintained in the main codebase and supports vLLM generation and a memory-efficient "
@@ -322,6 +383,24 @@ class GKDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if self.teacher_models is not None:
+            teacher_ids = inputs.get("teacher_id")
+            if (
+                not isinstance(teacher_ids, torch.Tensor)
+                or teacher_ids.dtype != torch.long
+                or teacher_ids.numel() != 1
+                or inputs["input_ids"].shape[0] != 1
+            ):
+                raise ValueError("MOPD requires batch size 1 and one torch.long teacher_id per batch.")
+            teacher_id = teacher_ids.item()
+            if teacher_id not in self.teacher_models:
+                raise ValueError(f"Unknown teacher_id {teacher_id}; expected one of {list(self.teacher_models)}.")
+            if teacher_id != self._active_teacher_id:
+                if self.teacher_model is not None:
+                    self.teacher_model.to("cpu")
+                self.teacher_model = self.teacher_models[teacher_id].to(self.accelerator.device)
+                self._active_teacher_id = teacher_id
+
         # compute student output
         student_outputs = model(
             input_ids=inputs["input_ids"],
@@ -353,6 +432,10 @@ class GKDTrainer(SFTTrainer):
             beta=self.beta,
             num_items_in_batch=num_items_in_batch,
         )
+
+        if self.teacher_models is not None:
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode][f"teacher/{teacher_id}/loss"].append(loss.detach().item())
 
         # empty cache
         empty_cache()

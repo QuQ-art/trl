@@ -1672,6 +1672,26 @@ training_args = GKDConfig(
 
 Structures post-training as three stages: general SFT, independent per-domain RL training of one expert per domain (e.g. verifiable-answer RL for math, sandboxed agent RL for software engineering), and a final MOPD stage that fuses the frozen domain experts into a single unified student. In that final stage, the student generates a trajectory per prompt, each trajectory is dispatched to its corresponding domain teacher (never averaged or ensembled across teachers), and the student is updated by minimizing the per-token reverse KL against that one teacher's distribution along the trajectory. Used in TRL via [`experimental.async_distillation.AsyncDistillationTrainer`], which implements this third, fusion stage: passing more than one entry in `teacher_server_urls` enables MOPD, with each row's `teacher_id` column selecting which (already-trained) teacher scores it. Use `beta=1.0` to match the paper's reverse-KL objective.
 
+The synchronous [`experimental.gkd.GKDTrainer`] also supports this fusion stage using local frozen teachers:
+pass an integer-keyed `teacher_models` mapping and a matching `teacher_id` in each example. It uses Transformers
+student generation and the full-vocabulary GKD loss, with one teacher resident on the training device at a time.
+This implementation covers single-device, batch-size-one domain routing; it does not reproduce the paper's
+distributed training system or train the domain experts.
+
+```python
+from trl.experimental.gkd import GKDConfig
+
+training_args = GKDConfig(
+    lmbda=1.0,  # On-policy student trajectories in the MOPD fusion stage.
+    beta=1.0,  # Reverse KL against the trajectory's domain teacher.
+    seq_kd=False,
+    per_device_train_batch_size=1,  # Current local-routing implementation limit, not a paper hyperparameter.
+    per_device_eval_batch_size=1,
+)
+# Supply teacher_models={0: math_teacher, 1: code_teacher, 2: if_teacher} to GKDTrainer.
+# This example does not reproduce the paper's optimizer, batch size, or decoding hyperparameters.
+```
+
 ### On the Position Bias of On-Policy Distillation
 
 **📜 Paper**: https://huggingface.co/papers/2606.22600

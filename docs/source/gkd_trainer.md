@@ -87,6 +87,51 @@ The dataset should be formatted as a list of "messages" where each message is a 
 * `role`: either `system`, `assistant` or `user`
 * `content`: the message content
 
+## Multi-teacher on-policy distillation
+
+Pass `teacher_models` instead of `teacher_model` to route each student completion to a frozen domain teacher.
+The keys are integer IDs; each dataset row must contain a matching integer `teacher_id`. For example, prepare
+Math, Code, and instruction-following examples with IDs `0`, `1`, and `2`, respectively. Validate any existing
+IDs against the dataset's domain before training.
+
+```python
+training_args = GKDConfig(
+    output_dir="gkd-mopd",
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    lmbda=1.0,
+    beta=1.0,
+    temperature=1.0,
+    seq_kd=False,
+)
+trainer = GKDTrainer(
+    model=student,
+    teacher_models={0: math_teacher, 1: code_teacher, 2: if_teacher},
+    args=training_args,
+    processing_class=tokenizer,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+Teachers can be model paths or instantiated models and must share the student's vocabulary and token IDs.
+The initial implementation supports a single device, batch size 1, full on-policy generation, and unquantized
+teachers without device maps. DeepSpeed and FSDP are not supported in multi-teacher mode. Teachers are frozen
+on CPU and the selected teacher is moved to the training device; the previous teacher is moved back to CPU
+before the next one is loaded. Student completions use Transformers generation, and only the selected teacher's
+full distribution contributes to the GKD loss. Per-teacher loss is logged as `teacher/<id>/loss`.
+
+The default collator preserves `teacher_id`; custom collators must return it as a `torch.long` tensor with one
+entry per sample. For prompt-only datasets, supply the complete rendered `prompt` string (including the generation
+prefix) and its `input_ids`, with `add_special_tokens=False` when tokenizing. This prevents the conversational
+collator from treating the last user message as a completion. Evaluation uses supplied completion labels and does
+not generate responses, so use completed conversations for evaluation.
+
+When GKD generates completions (`lmbda > 0` or `seq_kd=True`), the loss is averaged over the actual valid completion
+tokens in each microbatch, and Trainer averages these microbatch losses during gradient accumulation. The original
+dataset's label count is not used to normalize generated sequences. With batch size 1 this weights each sequence
+equally, including when generated lengths differ; it is not a token-weighted mean across the accumulation window.
+
 ## GKDTrainer
 
 [[autodoc]] experimental.gkd.GKDTrainer
