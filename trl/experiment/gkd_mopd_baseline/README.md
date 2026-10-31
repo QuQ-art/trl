@@ -24,14 +24,11 @@ bash trl/experiment/gkd_mopd_baseline/run.sh online --steps 6
 # 30-step fixed / online benchmark (first 6 steps as warmup)
 bash trl/experiment/gkd_mopd_baseline/run.sh fixed --steps 30 --warmup 6
 bash trl/experiment/gkd_mopd_baseline/run.sh online --steps 30 --warmup 6
-
-# Checkpoint reload verification
-bash trl/experiment/gkd_mopd_baseline/run.sh reload
 ```
 
 脚本默认使用实验服务器上的模型、coverage 和固定 rollout 路径。迁移到其他目录或机器时，可通过 `--model-root`、`--coverage`、`--fixed-rollouts` 和 `--output-root` 指定路径；GPU 可用 `CUDA_VISIBLE_DEVICES` 设置。默认结果目录为 `trl/experiment/gkd_mopd_baseline/results/`。
 
-每次运行生成 `config.json`、`steps.json`、`summary.json` 和 Student checkpoint；`reload` 将冷加载检查写入 `reload.json`。
+每次运行生成 `config.json`、`steps.json`、`summary.json` 和 Student checkpoint。
 
 ## Results
 
@@ -43,6 +40,6 @@ bash trl/experiment/gkd_mopd_baseline/run.sh reload
 | Fixed rollout, 30/6 | 102.92 s | — | 167.59 tokens/s | 51.74 GiB |
 | Online, 30/6 | 385.29 s | 62.48 tokens/s | 43.83 tokens/s | 51.84 GiB |
 
-6-step 与 30-step 在线训练均完成 Student 更新和三 Teacher 轮转；Teacher 参数保持不变，checkpoint 经独立 CPU 进程冷加载验证。固定 rollout 模式不包含生成耗时。
+6-step 与 30-step 在线训练均完成 Student 更新和三 Teacher 轮转；Teacher 参数保持不变。固定 rollout 模式不包含生成耗时。
 
 **Notes**：以上测试重复使用 6 条覆盖样本，仅用于基本正确性和性能测量；不能代表完整训练集的收敛结果。与 Unsloth 的 FP32 数值对照通过，BF16 严格数值一致性门限仍未通过。
